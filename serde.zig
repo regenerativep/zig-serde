@@ -332,7 +332,9 @@ pub const DefaultSpec = struct {
             .Int => return Num(Partial, .Big),
             .Float => return Num(Partial, .Big),
             .Enum => return Enum(@This(), meta.Tag(Partial), Partial),
-            else => unreachable,
+            .Optional => return Optional(@This(), Partial),
+            //else => unreachable,
+            else => @compileError("cant serde type " ++ @typeName(Partial)),
         }
     }
     pub fn IntegerSpec(comptime Partial: type) type {
@@ -389,7 +391,7 @@ pub fn NameEnum(comptime T: type, comptime Specs: []const type) type {
     return @Type(.{
         .Enum = .{
             .layout = .Auto,
-            .tag_type = std.math.IntFittingRange(0, field_infos.len - 1),
+            .tag_type = if (field_infos.len == 0) u8 else std.math.IntFittingRange(0, field_infos.len - 1),
             .fields = &enumFields,
             .decls = &decls,
             .is_exhaustive = true,
@@ -434,7 +436,7 @@ pub fn StructBuilder(
         usingnamespace if (uses_alloc) struct {
             pub const setField = @compileError("use setFieldAlloc");
 
-            pub fn setFieldAlloc(self: *Self, alloc: Allocator, reader: anytype, name: []const u8) !void {
+            pub fn setFieldAlloc(self: *Self, alloc: Allocator, reader: anytype, name: []const u8, args: anytype) !void {
                 const field_ind = @enumToInt(meta.stringToEnum(FieldEnum, name) orelse return error.UnexpectedField);
                 if (self.written_fields.isSet(@intCast(usize, field_ind))) {
                     return error.DuplicateField;
@@ -443,7 +445,15 @@ pub fn StructBuilder(
                     // use inline for to find and use corresponding Specs type to deserialize
                     inline for (fields) |field, i| {
                         if (i == field_ind) {
-                            const res = if (@hasDecl(Specs[i], "readAlloc")) Specs[i].readAlloc(alloc, reader) else Specs[i].read(reader);
+                            //const res = if (@hasDecl(Specs[i], "readAlloc"))
+                            //    Specs[i].readAlloc(alloc, reader)
+                            //else
+                            //    Specs[i].read(reader);
+                            const opts = std.builtin.CallOptions{};
+                            const res = if (@hasDecl(Specs[i], "readAlloc"))
+                                @call(opts, Specs[i].readAlloc, .{ alloc, reader } ++ args)
+                            else
+                                @call(opts, Specs[i].read, .{reader} ++ args);
                             if (meta.isError(res)) _ = res catch |err| return err;
                             // note: not our job to deinit on failure here
                             const val = res catch unreachable;
@@ -474,6 +484,7 @@ pub fn StructBuilder(
                 self: *Self,
                 reader: anytype,
                 name: []const u8,
+                args: anytype,
             ) !void {
                 const field_ind = @enumToInt(meta.stringToEnum(FieldEnum, name) orelse return error.UnexpectedField);
                 if (self.written_fields.isSet(@intCast(usize, field_ind))) {
@@ -482,7 +493,8 @@ pub fn StructBuilder(
                 blk: {
                     inline for (fields) |field, i| {
                         if (i == field_ind) {
-                            const res = Specs[i].read(reader);
+                            const opts = std.builtin.CallOptions{};
+                            const res = @call(opts, Specs[i].read, .{reader} ++ args);
                             if (meta.isError(res)) _ = res catch |err| return err;
                             const val = res catch unreachable;
                             @field(self.data, field.name) = val;
@@ -495,7 +507,12 @@ pub fn StructBuilder(
                 self.written_fields.setValue(@intCast(usize, field_ind), true);
             }
         };
-        pub fn nosetField(self: *Self, reader: anytype, name: []const u8) !void {
+        pub fn nosetField(
+            self: *Self,
+            reader: anytype,
+            name: []const u8,
+            args: anytype,
+        ) !void {
             const field_ind = @enumToInt(meta.stringToEnum(FieldEnum, name) orelse return error.UnexpectedField);
             if (self.written_fields.isSet(@intCast(usize, field_ind))) {
                 return error.DuplicateField;
@@ -503,7 +520,12 @@ pub fn StructBuilder(
             blk: {
                 inline for (fields) |_, i| {
                     if (i == field_ind) {
-                        const res = noRead(Specs[i], reader);
+                        //const res = noRead(Specs[i], reader);
+                        const opts = std.builtin.CallOptions{};
+                        const res = if (@hasDecl(Specs[i], "readAlloc"))
+                            @call(opts, Specs[i].readRest, .{reader} ++ args)
+                        else
+                            @call(opts, Specs[i].read, .{reader} ++ args);
                         if (meta.isError(res)) _ = res catch |err| return err;
                         break :blk;
                     }
@@ -514,6 +536,17 @@ pub fn StructBuilder(
             self.written_fields.setValue(@intCast(usize, field_ind), true);
         }
         pub fn done(self: Self) !T {
+            errdefer {
+                inline for (fields) |field, i| {
+                    const name = if (@hasDecl(Specs[i], "Name")) Specs[i].Name else field.name;
+                    if (!self.fields_with_data.isSet(i)) {
+                        std.log.err("missing \"{s}\"", .{name});
+                    }
+                }
+                if (@hasField(@TypeOf(self.data), "effects")) {
+                    std.log.err("effects: {any}", .{self.data.effects});
+                }
+            }
             if (self.fields_with_data.count() < Specs.len) return error.InsufficientFields;
             return self.data;
         }
@@ -934,7 +967,7 @@ pub fn IntegerPrefixed(
         };
         pub fn size(self: anytype) usize {
             const num = @intCast(IntTypeActual, InnerType.getInt(self));
-            if (options.max) |max| if (num > max) return error.PrefixedIntegerOutOfBounds;
+            //if (options.max) |max| if (num > max) return error.PrefixedIntegerOutOfBounds;
             return IntType.size(num) + InnerType.size(self);
         }
         pub fn readRest(reader: anytype) !void {
