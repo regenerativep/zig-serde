@@ -1023,6 +1023,157 @@ pub fn Prefixed(comptime Prefix: type, comptime T: type) type {
     };
 }
 
+pub fn writeArray(comptime T: type, arr: []const T.UserType, writer: anytype) !void {
+    // TODO: this check here shouldnt necessarily work all the time...
+    if (T.UserType == u8 or T.UserType == i8 or T.UserType == bool) {
+        const data = @bitCast([]const u8, arr);
+        try writer.writeAll(data);
+    } else {
+        for (arr) |elem| {
+            try T.write(elem, writer);
+        }
+    }
+}
+pub fn readArray(comptime T: type, data: []T.UserType, reader: anytype) !void {
+    if (T.UserType == u8 or T.UserType == i8) {
+        try reader.readNoEof(@bitCast([]u8, data));
+    } else {
+        for (data) |*elem| elem.* = try T.read(reader);
+    }
+}
+pub fn readArrayAlloc(comptime T: type, alloc: Allocator, data: []T.UserType, reader: anytype) !void {
+    for (data) |*elem, i| {
+        if (@hasDecl(T, "readAlloc")) {
+            errdefer {
+                var ind: usize = 0;
+                while (ind < i) : (ind += 1) {
+                    T.deinit(data[ind], alloc);
+                }
+            }
+            elem.* = try T.readAlloc(alloc, reader);
+        } else {
+            elem.* = try T.read(reader);
+        }
+    }
+}
+pub fn readRestArray(comptime T: type, reader: anytype, len: usize) !void {
+    if (@hasDecl(T, "Size")) {
+        const total_bytes = T.Size * len;
+        try reader.skipBytes(total_bytes, .{ .buf_size = 128 });
+    } else {
+        var i: usize = 0;
+        while (i < len) : (i += 1) try T.readRest(reader);
+    }
+}
+pub fn sizeArray(comptime T: type, arr: []const T.UserType) usize {
+    if (@hasDecl(T, "Size")) {
+        return T.Size * arr.len;
+    } else {
+        var total_size: usize = 0;
+        for (arr) |elem| {
+            total_size += T.size(elem);
+        }
+        return total_size;
+    }
+}
+
+pub const StaticArrayError = error{IncorrectLength};
+pub fn StaticArray(
+    comptime UsedSpec: type,
+    comptime ElementTypePartial: type,
+    comptime array_len: comptime_int,
+) type {
+    return struct {
+        pub const ElementType = UsedSpec.Spec(ElementTypePartial);
+        pub const UserType = [array_len]ElementType.UserType;
+        pub const IntType = usize;
+
+        pub fn getInt(self: anytype) usize {
+            _ = self;
+            return array_len;
+        }
+        pub fn write(self: UserType, writer: anytype) !void {
+            try writeArray(ElementType, &self, writer);
+        }
+
+        pub fn read(reader: anytype, len: usize) !UserType {
+            if (len != array_len) return error.IncorrectLength;
+            var self: UserType = undefined;
+            try readArray(ElementType, &self, reader);
+            return self;
+        }
+        usingnamespace if (@hasDecl(ElementType, "readAlloc")) struct {
+            pub fn readAlloc(alloc: Allocator, reader: anytype, len: usize) !UserType {
+                if (len != array_len) return error.IncorrectLength;
+                var self: UserType = undefined;
+                try readArrayAlloc(ElementType, alloc, &self, reader);
+                return self;
+            }
+            pub fn deinit(self: UserType, alloc: Allocator) void {
+                var i: usize = array_len;
+                while (i > 0) {
+                    i -= 1;
+                    ElementType.deinit(self[i], alloc);
+                }
+            }
+            pub fn readRest(reader: anytype, len: usize) !void {
+                if (len != array_len) return error.IncorrectLength;
+                try readRestArray(ElementType, reader, len);
+            }
+        } else struct {};
+
+        pub fn size(self: UserType) usize {
+            return sizeArray(ElementType, &self);
+        }
+    };
+}
+// i was going to call it a BoundedArray but then i remembered `std.BoundedArray` is already
+// a thing
+pub fn LimitedArray(
+    comptime UsedSpec: type,
+    comptime ElementTypePartial: type,
+    comptime max: comptime_int,
+) type {
+    return struct {
+        pub const ElementType = UsedSpec.Spec(ElementTypePartial);
+        pub const UserType = std.BoundedArray(ElementType.UserType, max);
+        pub const IntType = usize;
+
+        pub fn getInt(self: anytype) usize {
+            return self.len;
+        }
+        pub fn write(self: UserType, writer: anytype) !void {
+            try writeArray(ElementType, self.slice(), writer);
+        }
+
+        pub fn read(reader: anytype, len: usize) !UserType {
+            var self = try UserType.init(len);
+            try readArray(ElementType, self.slice(), reader);
+            return self;
+        }
+        usingnamespace if (@hasDecl(ElementType, "readAlloc")) struct {
+            pub fn readAlloc(alloc: Allocator, reader: anytype, len: usize) !UserType {
+                var self = try UserType.init(len);
+                try readArrayAlloc(ElementType, alloc, self.slice(), reader);
+                return self;
+            }
+            pub fn deinit(self: UserType, alloc: Allocator) void {
+                var i: usize = self.len;
+                while (i > 0) {
+                    i -= 1;
+                    ElementType.deinit(self.buffer[i], alloc);
+                }
+            }
+            pub fn readRest(reader: anytype, len: usize) !void {
+                try readRestArray(ElementType, reader, len);
+            }
+        } else struct {};
+
+        pub fn size(self: UserType) usize {
+            return sizeArray(ElementType, self.slice());
+        }
+    };
+}
 /// heap allocated array, requires a length
 pub fn DynamicArray(comptime UsedSpec: type, comptime ElementTypePartial: type) type {
     return struct {
@@ -1057,14 +1208,7 @@ pub fn DynamicArray(comptime UsedSpec: type, comptime ElementTypePartial: type) 
         };
 
         pub fn write(self: UserType, writer: anytype) !void {
-            if (ElementType.UserType == u8 or ElementType.UserType == i8 or ElementType.UserType == bool) {
-                const data = @bitCast([]const u8, self);
-                try writer.writeAll(data);
-            } else {
-                for (self) |elem| {
-                    try ElementType.write(elem, writer);
-                }
-            }
+            try writeArray(ElementType, self, writer);
         }
 
         pub fn getInt(self: anytype) usize {
@@ -1076,54 +1220,28 @@ pub fn DynamicArray(comptime UsedSpec: type, comptime ElementTypePartial: type) 
         pub fn readAlloc(alloc: Allocator, reader: anytype, len: usize) !UserType {
             var data = try alloc.alloc(ElementType.UserType, len);
             errdefer alloc.free(data);
-            if (ElementType.UserType == u8 or ElementType.UserType == i8) {
-                try reader.readNoEof(@bitCast([]u8, data));
+            if (@hasDecl(ElementType, "readAlloc")) {
+                try readArrayAlloc(ElementType, alloc, data, reader);
             } else {
-                for (data) |*elem, i| {
-                    if (@hasDecl(ElementType, "readAlloc")) {
-                        errdefer {
-                            var ind: usize = 0;
-                            while (ind < i) : (ind += 1) {
-                                ElementType.deinit(data[ind], alloc);
-                            }
-                        }
-                        elem.* = try ElementType.readAlloc(alloc, reader);
-                    } else {
-                        elem.* = try ElementType.read(reader);
-                    }
-                }
+                try readArray(ElementType, data, reader);
             }
             return data;
         }
         pub fn deinit(self: UserType, alloc: Allocator) void {
             if (@hasDecl(ElementType, "readAlloc")) {
-                for (self) |elem| {
-                    ElementType.deinit(elem, alloc);
+                var i: usize = self.len;
+                while (i > 0) {
+                    i -= 1;
+                    ElementType.deinit(self[i], alloc);
                 }
             }
             alloc.free(self);
         }
         pub fn readRest(reader: anytype, len: usize) !void {
-            if (@hasDecl(ElementType, "Size")) {
-                const total_bytes = ElementType.Size * len;
-                try reader.skipBytes(total_bytes, .{ .buf_size = 128 });
-            } else {
-                var i: usize = 0;
-                while (i < len) : (i += 1) {
-                    try noRead(ElementType, reader);
-                }
-            }
+            try readRestArray(ElementType, reader, len);
         }
         pub fn size(self: UserType) usize {
-            if (@hasDecl(ElementType, "Size")) {
-                return ElementType.Size * self.len;
-            } else {
-                var total_size: usize = 0;
-                for (self) |elem| {
-                    total_size += ElementType.size(elem);
-                }
-                return total_size;
-            }
+            return sizeArray(ElementType, self);
         }
     };
 }
@@ -1143,7 +1261,39 @@ pub fn PrefixedArrayMax(
     comptime ElementPartial: type,
     comptime max: comptime_int,
 ) type {
-    return IntegerPrefixed(UsedSpec, LengthPartial, DynamicArray(UsedSpec, ElementPartial), .{ .max = max });
+    return IntegerPrefixed(
+        UsedSpec,
+        LengthPartial,
+        DynamicArray(UsedSpec, ElementPartial),
+        .{ .max = max },
+    );
+}
+
+pub fn PrefixedLimitedArray(
+    comptime UsedSpec: type,
+    comptime LengthPartial: type,
+    comptime ElementPartial: type,
+    comptime max: comptime_int,
+) type {
+    return IntegerPrefixed(
+        UsedSpec,
+        LengthPartial,
+        LimitedArray(UsedSpec, ElementPartial, max),
+        .{},
+    );
+}
+pub fn PrefixedStaticArray(
+    comptime UsedSpec: type,
+    comptime LengthPartial: type,
+    comptime ElementPartial: type,
+    comptime len: comptime_int,
+) type {
+    return IntegerPrefixed(
+        UsedSpec,
+        LengthPartial,
+        StaticArray(UsedSpec, ElementPartial, len),
+        .{},
+    );
 }
 
 test "serde prefixed array" {
