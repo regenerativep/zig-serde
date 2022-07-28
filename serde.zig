@@ -25,7 +25,7 @@ pub fn GetUserType(comptime Partial: type) type {
             .Struct => StructUserType(Partial),
             .Union => UnionUserType(Partial),
             .Optional => OptionalUserType(Partial),
-            .Void, .Int, .Float, .Enum => Partial,
+            .Void, .Int, .Float, .Enum, .Bool => Partial,
             else => @compileError("Unable to generate a user type for: " ++ @typeName(Partial)),
         };
     }
@@ -329,7 +329,7 @@ pub fn Union(comptime UsedSpec: type, comptime PartialUnion: type, comptime user
     assert(partial_info.Union.tag_type != null);
     const user_info = @typeInfo(userType);
     return struct {
-        pub const Specs = fieldSpecs(UsedSpec, PartialUnion);
+        pub const Specs = fieldSpecs(UsedSpec, PartialUnion, UserType);
         pub const UserType = userType;
         pub const TagType = user_info.Union.tag_type.?;
         pub const SerdeName = .Union;
@@ -555,7 +555,7 @@ pub fn TaggedUnion(
     comptime unionUserType: type,
 ) type {
     const Tag = UsedSpec.Spec(PartialTag, PartialTag);
-    const UnionTag = @typeInfo(UnionUserType).tag_type.?;
+    const UnionTag = @typeInfo(unionUserType).Union.tag_type.?;
     return Prefixed(AsEnum(Tag, UnionTag), Union(UsedSpec, PartialUnion, unionUserType));
 }
 
@@ -813,6 +813,7 @@ pub const CodepointArray = struct {
     pub const Stepped = struct {
         index: usize = 0,
         len: usize,
+
         const Self = @This();
         pub fn init(len: usize) Self {
             return .{
@@ -1268,7 +1269,7 @@ test "serde remaining" {
     const Partial = struct {
         a: i32,
         data: Remaining(bare.Spec(u8, u8)),
-    }; // TODO: into shit
+    };
     const UserType = GetUserType(Partial);
     const SpecType = bare.Spec(Partial, UserType);
 
@@ -1279,4 +1280,19 @@ test "serde remaining" {
     try testing.expectEqual(@as(i32, 258), result.a);
     try testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x08, 0x10, 0x00, 0x02 }, result.data);
     try testing.expectEqual(buf.len, SpecType.size(result));
+}
+
+test "codepoint string" {
+    const words = "你好，我们没有时间。";
+    var buf: [words.len]u8 = undefined;
+    std.mem.copy(u8, &buf, words);
+    var reader = std.io.fixedBufferStream(&buf);
+    var result = try CodepointArray.readAlloc(testing.allocator, reader.reader(), 10);
+    defer CodepointArray.deinit(result, testing.allocator);
+    var buffer = std.ArrayList(u8).init(testing.allocator);
+    defer buffer.deinit();
+    try CodepointArray.write(result, buffer.writer());
+    try testing.expectEqual(@as(usize, 10), CodepointArray.getPrefix(result));
+    try testing.expectEqualStrings(words, result);
+    try testing.expectEqual(@as(usize, 30), CodepointArray.size(result));
 }
