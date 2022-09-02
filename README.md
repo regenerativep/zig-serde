@@ -4,6 +4,8 @@ Serialization and deserialization library in Zig.
 
 I made this to make it easy to specify a format using Zig types and just be given the functions necessary to serialize and deserialize the data specified by the format.
 
+warning: following parts of readme might not be up to date
+
 ## Usage
 
 Specify a format. This is in the form of a Zig type.
